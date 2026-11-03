@@ -2,12 +2,13 @@
 
 A tiny instant-replay clipper for Windows, like Medal or ShadowPlay, but without the bloat.
 
-LiteClip keeps the last few seconds of your screen in a rolling buffer. Press a hotkey and those seconds are saved as an MP4. Both screen capture (Desktop Duplication) and encoding (NVENC) run on your NVIDIA GPU, so it barely touches your CPU and your games stay smooth.
+LiteClip keeps the last few seconds of your screen in a rolling buffer. Press a hotkey and those seconds are saved as an MP4. Screen capture and encoding run on your graphics card (NVIDIA, AMD or Intel), so it barely touches your CPU and your games stay smooth.
 
 ## Features
 
 - Instant replay: save the last 15 to 120 seconds with one hotkey
 - GPU capture and encoding, with almost no CPU or memory use
+- Works with NVIDIA, AMD and Intel graphics, including gaming laptops, and automatically picks the best encoder for your PC
 - A global hotkey that works in fullscreen games, and warns you if another app already uses it
 - Runs quietly in the system tray, and can start with Windows
 - A recent clips list with thumbnails and Play, Show and Delete buttons
@@ -18,7 +19,7 @@ LiteClip keeps the last few seconds of your screen in a rolling buffer. Press a 
 ## Requirements
 
 - Windows 10 or 11
-- An NVIDIA GPU (GTX 900 series or newer) with up-to-date drivers
+- Any graphics card from the last ~8 years (NVIDIA GTX 900+, AMD RX 400+, or Intel 6th-gen+ graphics) with up-to-date drivers. If none of these is available, LiteClip can record with your CPU instead
 - [FFmpeg](https://ffmpeg.org) 6.1 or newer. If it's missing, LiteClip offers to install it for you on first launch, using `winget install Gyan.FFmpeg`
 
 ## Getting started
@@ -58,6 +59,7 @@ FFmpeg needs an audio device to record from. Either enable **Stereo Mix** (Sound
 ## Troubleshooting
 
 - **Black or empty clips:** switch your game to borderless windowed mode.
+- **"Video encoder couldn't start":** set **Settings → Encoder** to **Auto** and update your graphics drivers. On laptops, LiteClip uses a special laptop mode automatically when it needs to.
 - **The hotkey doesn't work:** another app may already be using it. NVIDIA's overlay uses Alt+F10, for example. Pick a different one in Settings.
 - **Clips won't save to a folder:** Windows Security's *Controlled folder access* may be blocking it. Allow LiteClip and ffmpeg.exe, or choose another folder.
 - **Recording stops by itself:** LiteClip restarts the recorder automatically after hiccups like UAC prompts or a game changing resolution. If it keeps stopping, it shows you the reason.

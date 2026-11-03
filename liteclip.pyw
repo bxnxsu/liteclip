@@ -27,7 +27,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 APP_NAME = "LiteClip"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 try:
     import customtkinter as ctk
@@ -77,7 +77,68 @@ FONT = "Segoe UI"
 CLIP_LENGTHS = [15, 30, 45, 60, 90, 120]
 FPS_OPTIONS = ["30", "60", "120", "144"]
 QUALITY = {"Low": "10M", "Medium": "20M", "High": "35M", "Ultra": "50M"}
-CODECS = {"H.264": "h264_nvenc", "HEVC": "hevc_nvenc"}
+CODECS = {"H.264": "h264_nvenc", "HEVC": "hevc_nvenc"}  # labels shown in Settings
+
+# How each GPU type gets frames from the screen-capture (which lives on the GPU) into its encoder.
+# "_copy" variants copy frames through system memory first. They are needed on laptops where the
+# screen is wired to one GPU (e.g. Intel) but the encoder is on another (e.g. NVIDIA).
+PIPELINES = {
+    "nvenc":      ("NVIDIA", None, {"H.264": "h264_nvenc", "HEVC": "hevc_nvenc"}, ["-preset", "p4", "-rc", "cbr"]),
+    "amf":        ("AMD", None, {"H.264": "h264_amf", "HEVC": "hevc_amf"}, ["-quality", "speed", "-rc", "cbr"]),
+    "qsv":        ("Intel", "hwmap=derive_device=qsv,format=qsv", {"H.264": "h264_qsv", "HEVC": "hevc_qsv"},
+                   ["-preset", "veryfast"]),
+    "nvenc_copy": ("NVIDIA (laptop mode)", "hwdownload,format=bgra", {"H.264": "h264_nvenc", "HEVC": "hevc_nvenc"},
+                   ["-preset", "p4", "-rc", "cbr"]),
+    "amf_copy":   ("AMD (laptop mode)", "hwdownload,format=bgra,format=nv12", {"H.264": "h264_amf", "HEVC": "hevc_amf"},
+                   ["-quality", "speed", "-rc", "cbr"]),
+    "qsv_copy":   ("Intel (laptop mode)", "hwdownload,format=bgra,format=nv12", {"H.264": "h264_qsv", "HEVC": "hevc_qsv"},
+                   ["-preset", "veryfast"]),
+    "cpu":        ("Processor (CPU)", "hwdownload,format=bgra,format=yuv420p", {"H.264": "libx264"},
+                   ["-preset", "veryfast", "-tune", "zerolatency"]),
+}
+ENCODER_CHOICES = ["Auto", "NVIDIA", "AMD", "Intel", "CPU"]
+PROBE_ORDER = {
+    "Auto": ["nvenc", "amf", "qsv", "nvenc_copy", "amf_copy", "qsv_copy", "cpu"],
+    "NVIDIA": ["nvenc", "nvenc_copy"],
+    "AMD": ["amf", "amf_copy"],
+    "Intel": ["qsv", "qsv_copy"],
+    "CPU": ["cpu"],
+}
+
+
+def pipeline_codec(pipeline, codec):
+    """The format a pipeline will actually produce (CPU mode is always H.264 to stay light)."""
+    return codec if codec in PIPELINES[pipeline][2] else "H.264"
+
+
+def pipeline_video_args(pipeline, codec, bitrate, fps):
+    _label, vf, codecs, extra = PIPELINES[pipeline]
+    args = ["-vf", vf] if vf else []
+    args += ["-c:v", codecs[pipeline_codec(pipeline, codec)]] + extra
+    args += ["-b:v", bitrate, "-g", str(fps * SEGMENT_SECONDS),
+             "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_SECONDS})"]
+    return args
+
+
+def probe_key(s):
+    return f"{s['encoder']}|{s['codec']}|{int(s['monitor'])}|{FFMPEG}"
+
+
+def detect_pipeline(s):
+    """Try each encoder for ~1 second and return the first one that works on this PC."""
+    errors = []
+    for name in PROBE_ORDER.get(s["encoder"], PROBE_ORDER["Auto"]):
+        cmd = [FFMPEG, "-hide_banner", "-nostdin", "-loglevel", "error",
+               "-f", "lavfi", "-i", f"ddagrab=output_idx={int(s['monitor'])}:framerate=30", "-t", "1"]
+        cmd += pipeline_video_args(name, s["codec"], "6M", 30) + ["-an", "-f", "null", "-"]
+        try:
+            r = run_once(cmd, timeout=25)
+            if r.returncode == 0:
+                return name, ""
+            errors.append(f"{PIPELINES[name][0]}: {r.stderr.strip()[-200:]}")
+        except Exception as e:
+            errors.append(f"{PIPELINES[name][0]}: {e}")
+    return None, "\n".join(errors)
 
 # Windows hotkey constants
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x4000
@@ -103,6 +164,9 @@ DEFAULTS = {
     "fps": 60,
     "bitrate": "20M",
     "codec": "H.264",
+    "encoder": "Auto",
+    "pipeline": "",
+    "pipeline_for": "",
     "monitor": 0,
     "audio_device": "None",
     "hotkey_mods": MOD_ALT,
@@ -261,10 +325,10 @@ def resolve_ffmpeg(setting):
 def friendly_error(log):
     """Turn FFmpeg's error text into something a normal person can act on."""
     l = (log or "").lower()
-    if "nvenc" in l or "nvcuda" in l or "openencodesession" in l or "no capable devices" in l:
-        return ("Your NVIDIA video encoder couldn't start. LiteClip needs an NVIDIA graphics card "
-                "(GTX 900 series or newer) with up-to-date drivers. Too many apps recording at once "
-                "(OBS, Discord streaming, the NVIDIA app) can also cause this.")
+    if any(k in l for k in ("nvenc", "nvcuda", "openencodesession", "no capable devices", "_amf", "amf ",
+                            "_qsv", "mfx", "libvpl")):
+        return ("The graphics card's video encoder couldn't start. Set Settings > Encoder to Auto so "
+                "LiteClip can find one that works, and make sure your graphics drivers are up to date.")
     if "ddagrab" in l and ("no such filter" in l or "not found" in l):
         return "Your FFmpeg is too old. Update it with:  winget upgrade Gyan.FFmpeg"
     if "output_idx" in l or "invalid output" in l or ("ddagrab" in l and "output" in l and "fail" in l):
@@ -553,11 +617,15 @@ class Recorder:
     def __init__(self):
         self.proc = None
         self.log = None
+        self.pipeline = "nvenc"
+        self.active_codec = "H.264"
 
     def running(self):
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self, s):
+    def start(self, s, pipeline=None):
+        self.pipeline = pipeline or self.pipeline
+        self.active_codec = pipeline_codec(self.pipeline, s["codec"])
         kill_stale_recorder()
         shutil.rmtree(BUF_DIR, ignore_errors=True)
         os.makedirs(BUF_DIR, exist_ok=True)
@@ -571,9 +639,7 @@ class Recorder:
         cmd += ["-map", "0:v"]
         if audio:
             cmd += ["-map", "1:a", "-af", "aresample=async=1000", "-c:a", "aac", "-b:a", "160k"]
-        cmd += ["-c:v", CODECS.get(s["codec"], "h264_nvenc"), "-preset", "p4", "-rc", "cbr",
-                "-b:v", s["bitrate"], "-g", str(fps * SEGMENT_SECONDS),
-                "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_SECONDS})"]
+        cmd += pipeline_video_args(self.pipeline, s["codec"], s["bitrate"], fps)
         wrap = wrap_count(s["clip_seconds"])
         cmd += ["-f", "segment", "-segment_time", str(SEGMENT_SECONDS), "-segment_wrap", str(wrap),
                 "-segment_format", "mpegts", "-segment_list", SEGMENT_LIST, "-segment_list_type", "csv",
@@ -1072,10 +1138,22 @@ class App:
             self.w_audio_refresh.pack(side="left", padx=(8, 0))
             return f
 
+        self.v_encoder = tk.StringVar(value=self.s["encoder"] if self.s["encoder"] in ENCODER_CHOICES else "Auto")
+        self.w_encoder = self._setting(rec, "Encoder", "Auto finds the best option for your PC the first time you "
+                                                       "record. NVIDIA, AMD and Intel use your GPU; CPU works "
+                                                       "anywhere but uses more processing power.",
+                                       lambda m: ctk.CTkOptionMenu(m, values=ENCODER_CHOICES, variable=self.v_encoder,
+                                                                   width=160, command=self.on_setting_change,
+                                                                   **self.opt_style))
+        self.encoder_lbl = ctk.CTkLabel(rec, text="", font=self.f_small, text_color=MUTED)
+        self.encoder_lbl.grid(row=rec.next_row, column=0, columnspan=2, sticky="w", padx=22, pady=(0, 6))
+        rec.next_row += 1
+
         self._setting(rec, "Audio", "Record desktop sound. Needs 'Stereo Mix' or a virtual audio cable.",
                       audio_ctrl)
 
-        self.capture_widgets = [self.w_len, self.w_fps, self.w_quality, self.w_codec,
+        self.update_encoder_label()
+        self.capture_widgets = [self.w_encoder, self.w_len, self.w_fps, self.w_quality, self.w_codec,
                                 self.w_monitor, self.w_audio, self.w_audio_refresh]
 
         # --- Hotkey
@@ -1230,6 +1308,7 @@ class App:
         s["fps"] = int(self.w_fps.get() or 60)
         s["bitrate"] = QUALITY.get(self.w_quality.get(), "20M")
         s["codec"] = self.w_codec.get() or "H.264"
+        s["encoder"] = self.v_encoder.get() or "Auto"
         s["monitor"] = int(self.v_monitor.get().split()[-1]) - 1
         s["audio_device"] = self.v_audio.get() or "None"
         s["clips_dir"] = clean_dir(self.v_dir.get())
@@ -1246,6 +1325,7 @@ class App:
 
     def on_setting_change(self, *_):
         self.gather()
+        self.update_encoder_label()
         self.update_stats()
         self.update_hero(force=True)
 
@@ -1392,14 +1472,49 @@ class App:
         if not ffmpeg_available():
             self.offer_ffmpeg_install()
             return
+        if self.s.get("pipeline") in PIPELINES and self.s.get("pipeline_for") == probe_key(s):
+            self.begin_recording(self.s["pipeline"])
+            return
+        if getattr(self, "probing", False):
+            return
+        self.probing = True
+        self.rec_btn.configure(text="Checking your PC…", state="disabled")
+        self.notify("Finding the best video encoder for your PC. This only happens once.", ms=6000)
+        threading.Thread(target=lambda: self.q.put(("probed", detect_pipeline(s))), daemon=True).start()
+
+    def finish_probe(self, result):
+        self.probing = False
+        self.rec_btn.configure(state="normal")
+        name, errors = result
+        if not name:
+            self.set_recording(False)
+            self.show_window()
+            messagebox.showerror(APP_NAME, "LiteClip couldn't find a video encoder that works on this PC.\n\n"
+                                           "Update your graphics drivers and try again, or set Settings > "
+                                           "Encoder to CPU.\n\nDetails:\n" + errors[-900:])
+            return
+        self.s["pipeline"], self.s["pipeline_for"] = name, probe_key(self.s)
+        save_settings(self.s)
+        self.update_encoder_label()
+        self.begin_recording(name)
+
+    def begin_recording(self, pipeline):
         try:
-            self.rec.start(s)
+            self.rec.start(self.s, pipeline)
         except Exception as e:
             messagebox.showerror(APP_NAME, f"Couldn't start recording:\n\n{e}")
+            self.set_recording(False)
             return
         self.rec_started = time.time()
         self.set_recording(True)
         self.root.after(6000, self.check_buffer)
+
+    def update_encoder_label(self):
+        p = self.s.get("pipeline")
+        if p in PIPELINES and self.s.get("pipeline_for", "").startswith(self.v_encoder.get() + "|"):
+            self.encoder_lbl.configure(text=f"Using: {PIPELINES[p][0]}")
+        else:
+            self.encoder_lbl.configure(text="LiteClip will check which encoder works when you start recording.")
 
     def stop(self):
         self.rec.stop()
@@ -1412,6 +1527,10 @@ class App:
         self.rec.stop()
         now = time.time()
         self.restarts = [t for t in getattr(self, "restarts", []) if now - t < 120]
+        if now - self.rec_started <= 10:
+            self.s["pipeline_for"] = ""
+            save_settings(self.s)
+            self.update_encoder_label()
         if now - self.rec_started > 10 and len(self.restarts) < 3:
             self.restarts.append(now)
             try:
@@ -1496,7 +1615,7 @@ class App:
             return
         self.saving = True
         self.save_btn.configure(text="Saving…", state="disabled")
-        s = dict(self.s, clips_dir=folder)
+        s = dict(self.s, clips_dir=folder, codec=self.rec.active_codec)
 
         def work():
             try:
@@ -1645,6 +1764,8 @@ class App:
                     else:
                         self.notify("FFmpeg didn't install. Check the installer window for the error.", "error",
                                     ms=9000)
+                elif kind == "probed":
+                    self.finish_probe(data)
                 elif kind == "thumb":
                     self.set_thumb(*data)
                 elif kind == "show":
