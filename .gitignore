@@ -1,0 +1,14 @@
+# Build output
+build/
+dist/
+*.spec
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Don't upload FFmpeg or clips
+ffmpeg.exe
+ffprobe.exe
+*.mp4
+*.ts
